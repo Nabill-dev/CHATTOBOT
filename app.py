@@ -17,3 +17,4 @@ if str(ROOT_DIR) not in sys.path:
 
 # Eksekusi antarmuka Streamlit utama
 runpy.run_path(str(SRC_DIR / "app.py"), run_name="__main__")
+

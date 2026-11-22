@@ -1,0 +1,41 @@
+{
+  "model_base": "indolem/indobertweet-base-uncased",
+  "kelas": [
+    "bukti_bayar",
+    "pembayaran_umum",
+    "kegiatan_pmb",
+    "login_akun",
+    "beasiswa_pendaftaran",
+    "lainnya"
+  ],
+  "kelas_eskalasi": [
+    "beasiswa_pendaftaran",
+    "lainnya"
+  ],
+  "ambang_peluang_eskalasi": 0.1,
+  "max_length": 96,
+  "seed": 42,
+  "epoch": 6,
+  "learning_rate": 5e-05,
+  "batch_size": 8,
+  "weight_decay": 0.01,
+  "warmup_ratio": 0.1,
+  "grad_clip": 1.0,
+  "versi_pustaka": {
+    "torch": "2.14.1+cu126",
+    "transformers": "5.20.2",
+    "sklearn": "1.9.1"
+  },
+  "tanggal": "2026-11-05",
+  "jumlah_data_latih": 166,
+  "daftar_chat_uji_akhir": [
+    2,
+    4,
+    6,
+    18,
+    20,
+    21,
+    30,
+    33
+  ]
+}

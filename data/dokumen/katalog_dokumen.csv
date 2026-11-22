@@ -1,0 +1,7 @@
+id,nama_berkas,jenis,sumber,tanggal_berlaku,tanggal_kedaluwarsa,status,diverifikasi_admin,berlaku_untuk,catatan
+DOC001,panduan EKTM.docx,resmi,admin kampus,2026-10-01,,nonaktif,ya,semua angkatan,"Panduan pembayaran eKTM; dinonaktifkan digantikan DOC005"
+DOC002,Transkrip_Wawancara_Chatbot_ADM_Campus.docx,wawancara,wawancara admin,2026-10-01,,aktif,tidak,internal,"Wawancara admin; HANYA untuk konteks/aturan eskalasi, BUKAN sumber jawaban bot"
+DOC003,Transkrip_Wawancara_Dirapikan.docx,wawancara,wawancara admin,2026-10-01,,aktif,tidak,internal,"Versi rapih wawancara admin; HANYA untuk konteks"
+DOC004,jawaban Pertanyaan fikkss.docx,wawancara,wawancara admin,2026-10-01,,aktif,tidak,internal,"Jawaban pertanyaan fikss; BELUM terverifikasi"
+DOC005,Penjelasan_Fitur_EKTM_BSI_ID_Lengkap.docx,resmi,admin kampus,2026-11-04,,nonaktif,tidak,semua angkatan,"Panduan resmi fitur eKTM BSI.ID lengkap; dinonaktifkan digantikan DOC006"
+DOC006,Penjelasan_Fitur_EKTM_BSI_ID_Lengkap update.docx,resmi,admin kampus,2026-11-09,,aktif,tidak,semua angkatan,"Panduan resmi fitur eKTM BSI.ID lengkap update tata cara bayar pengganti DOC005"

@@ -1,0 +1,37 @@
+# ============================================================
+# requirements.txt — CHATTOBOT Hugging Face Spaces (CPU)
+# ============================================================
+
+torch
+transformers==5.20.2
+sentence-transformers==6.1.0
+scikit-learn==1.9.1
+numpy==2.5.4
+scipy==1.18.1
+joblib==1.6.0
+safetensors==0.8.0
+
+# --- Tokenizer & Hub ---
+tokenizers==0.23.3
+huggingface_hub==1.33.0
+
+# --- Basis data vektor ---
+chromadb==1.5.9
+
+# --- Pencarian kata kunci ---
+rank-bm25==0.2.2
+
+# --- Data & file ---
+pandas==3.0.6
+openpyxl==3.1.5
+python-docx==1.2.0
+
+# --- Antarmuka web ---
+streamlit==1.66.1
+
+# --- Gemini API (Opsional untuk Sistem A) ---
+google-genai==2.31.0
+
+# --- Utilitas ---
+python-dotenv==1.2.4
+tqdm==4.70.1

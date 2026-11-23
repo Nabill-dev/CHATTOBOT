@@ -313,9 +313,9 @@ with st.sidebar:
         st.subheader("Model Perute (Router)")
         router_aktif_pilihan = st.selectbox(
             "Pilih Router Aktif:",
-            options=["indobertweet", "klasik", "aturan"],
-            index=0 if ROUTER_AKTIF == "indobertweet" else (1 if ROUTER_AKTIF == "klasik" else 2),
-            help="indobertweet: Transformer fine-tuned (T6c)\nklasik: TF-IDF + Logistic Regression (T5)\naturan: Berbasis kata kunci (T1)"
+            options=["cascade (otomatis)", "indobertweet", "klasik", "aturan"],
+            index=0,
+            help="cascade (otomatis): Bertingkat IndoBERTweet -> TF-IDF Klasik -> Aturan\nindobertweet: Transformer fine-tuned (T6c)\nklasik: TF-IDF + Logistic Regression (T5)\naturan: Berbasis kata kunci (T1)"
         )
 
         st.subheader("Susunan Sistem (Pipeline)")
@@ -448,7 +448,8 @@ for msg in st.session_state.messages:
                 st.caption(f"⚙️ **Susunan Sistem:** `{susunan_detail}`")
                 col_t1, col_t2 = st.columns(2)
                 with col_t1:
-                    st.write(f"**Router Aktif:** `{detail.get('router_pakai', router_aktif_pilihan)}`")
+                    st.write(f"**Router Mode:** `{detail.get('router_pakai', router_aktif_pilihan)}`")
+                    st.write(f"**Router Penjawab:** `{detail.get('router_penjawab', '-')}`")
                     st.write(f"**Kelas Router:** `{detail.get('kelas_router', '-')}`")
                     st.write(f"**Keyakinan Router:** `{detail.get('keyakinan', 0):.4f}`")
                     st.write(f"**Peluang Eskalasi:** `{detail.get('peluang_eskalasi', 0):.4f}`")
@@ -462,6 +463,17 @@ for msg in st.session_state.messages:
                     st.write(f"**Waktu Respons:** `{detail.get('waktu_ms', 0)} ms`")
 
                 st.write(f"**Alasan Keputusan:** {detail.get('alasan', '-')}")
+
+                # Tampilkan rincian cascade jika ada
+                t_cascade = detail.get("telemetri_cascade")
+                if t_cascade:
+                    st.markdown("**Alur Cascade Router:**")
+                    c_bert = t_cascade.get('indobertweet', {})
+                    c_klas = t_cascade.get('klasik', {})
+                    c_atur = t_cascade.get('aturan', {})
+                    st.markdown(f"- **1. IndoBERTweet:** `{c_bert.get('status', '-')}` — *{c_bert.get('alasan', '-')}*")
+                    st.markdown(f"- **2. TF-IDF Klasik:** `{c_klas.get('status', '-')}` — *{c_klas.get('alasan', '-')}*")
+                    st.markdown(f"- **3. Aturan Panduan:** `{c_atur.get('status', '-')}` — *{c_atur.get('alasan', '-')}*")
 
                 # Tampilkan daftar potongan teks jika ada
                 potongan = detail.get("potongan_terpakai", [])

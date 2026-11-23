@@ -475,8 +475,15 @@ def periksa_topik_terlarang(pesan: str) -> tuple[bool, str]:
     # 5c. Aturan kata kunci keras: tarif/biaya/harga + kegiatan atau wisuda atau seminar atau workshop atau serkom atau jaket
     kata_biaya = ['tarif', 'biaya', 'harga', 'nominal']
     kata_kegiatan = ['kegiatan', 'wisuda', 'seminar', 'workshop', 'serkom', 'jaket', 'ormik', 'semaba', 'pmb', 'ta', 'skripsi']
-    if any(b in pesan_l for b in kata_biaya) and any(k in pesan_l for k in kata_kegiatan):
+    # Gunakan batasan kata utuh agar kata seperti 'mutasi' tidak cocok dengan 'ta'
+    ada_kata_biaya = any(re.search(r'\b' + re.escape(b) + r'\b', pesan_l) for b in kata_biaya)
+    ada_kata_kegiatan = any(re.search(r'\b' + re.escape(k) + r'\b', pesan_l) for k in kata_kegiatan)
+    if ada_kata_biaya and ada_kata_kegiatan:
         return True, "Aturan kata kunci: Informasi tarif/biaya/harga kegiatan, wisuda, seminar, workshop, serkom, atau jaket dialihkan langsung ke staf administrasi."
+
+    # Pertanyaan cara/petunjuk bayar mutasi bukan menanyakan nominal, diperiksa terpisah jika menanyakan nominal rincian mutasi
+    if 'mutasi' in pesan_l and any(re.search(r'\b' + re.escape(b) + r'\b', pesan_l) for b in ['berapa', 'nominal', 'tarif', 'harga']):
+        return True, "Informasi rincian nominal biaya mutasi akademik dialihkan langsung ke staf administrasi."
 
     # 6. Pengunduran diri / ketidakmampuan bayar
     if any(k in pesan_l for k in ['undur diri', 'mengundurkan diri', 'tidak mampu bayar', 'keringanan spp', 'pindah prodi']):
@@ -600,6 +607,16 @@ def format_jawaban_manusiawi(teks_raw: str, metadata: dict, pesan_pengguna: str)
         isi_terformat = "\n".join(baris_list)
         penutup = "\n\nSemoga membantu! Pastikan proses mutasi sudah diajukan secara resmi ya."
 
+    elif 'Petunjuk Pembayaran Kuliah' in judul_bagian:
+        pembuka = "Halo! Untuk panduan dan langkah pembayaran **Biaya Kuliah**, berikut informasinya ya:\n\n"
+        isi_terformat = "\n".join(baris_list)
+        penutup = "\n\nSemoga membantu! Pastikan selalu mengecek status transaksi di aplikasi EKTM Anda ya."
+
+    elif 'Histori Pembayaran' in judul_bagian:
+        pembuka = "Halo! Untuk melihat **Riwayat / Histori Pembayaran Akademik**, berikut langkah-langkahnya:\n\n"
+        isi_terformat = "\n".join(baris_list)
+        penutup = "\n\nSemoga informasinya jelas! Anda dapat melihat seluruh riwayat transaksi sebelumnya pada menu tersebut."
+
     elif 'Beranda Utama' in jejak_judul or 'Kartu Mahasiswa' in teks_bersih:
         pembuka = "Halo! Terkait tampilan dan cara melihat **Kartu Mahasiswa Digital (E-KTM)**, berikut penjelasannya:\n\n"
         isi_terformat = "\n".join(baris_list)
@@ -638,142 +655,210 @@ def format_jawaban_manusiawi(teks_raw: str, metadata: dict, pesan_pengguna: str)
 
 
 # ==============================================================
-# FUNGSI UTAMA BOT
+# ROUTER CASCADE & ATURAN SEGMEN PANDUAN BSI.ID
 # ==============================================================
 
-def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> dict:
+def inferensi_klasik_lazy(teks: str) -> dict:
     """
-    Implementasi penalaran Sistem B:
-    Normalisasi -> Router -> Cek Kebijakan -> Chroma Search -> Filter Ambang -> Output Konservatif.
-    Mendukung tiga susunan sistem (Tugas 1):
-      - V1 (standar): router -> pencarian -> gerbang kata kunci
-      - V2 (eksperimen, belum divalidasi): pencarian dulu; router hanya veto jika P(eskalasi) >= AMBANG_VETO_V2
-      - V3 (eksperimen, belum divalidasi): gerbang kata kunci diganti skor gabungan = jarak kosinus dan overlap
+    Memuat router klasik TF-IDF + Regresi Logistik secara lazy (on-demand),
+    menghitung probabilitas inferensi, dan langsung membersihkan memori.
+    Ambang P(eskalasi) = 0.300.
     """
-    mulai_waktu = time.perf_counter()
+    import joblib, gc
+    klasik_path = ROOT / "models" / "router_klasik.joblib"
+    if not klasik_path.exists():
+        return None
+    model_obj = joblib.load(klasik_path)
+    probs = model_obj.predict_proba([teks])[0]
+    classes = list(model_obj.classes_)
+    idx_max = int(probs.argmax())
+    kls = classes[idx_max]
+    conf = float(probs[idx_max])
 
-    if susunan is None:
-        susunan = SUSUNAN_AKTIF.strip().upper()
+    p_esk = 0.0
+    if "beasiswa_pendaftaran" in classes:
+        p_esk += float(probs[classes.index("beasiswa_pendaftaran")])
+    if "lainnya" in classes:
+        p_esk += float(probs[classes.index("lainnya")])
+
+    ambang_klasik = 0.300
+    keputusan = "teruskan" if (kls in KELAS_ESKALASI or p_esk >= ambang_klasik) else "jawab"
+    dist = {c: round(float(p), 4) for c, p in zip(classes, probs)}
+    del model_obj
+    gc.collect()
+    return {
+        'kelas': kls,
+        'keyakinan': round(conf, 4),
+        'peluang_eskalasi': round(p_esk, 4),
+        'keputusan': keputusan,
+        'distribusi_probabilitas': dist
+    }
+
+
+SEGMEN_ATURAN_LIST = [
+    {
+        'id': 'K1',
+        'nama': 'Cara membayar Biaya Kuliah & Metode Pembayaran',
+        'target_judul': 'Petunjuk Pembayaran Kuliah',
+        'pola': [
+            r'langkah.*bayar.*kuliah',
+            r'gimana.*langkah.*bayar.*kuliah',
+            r'cara.*bayar.*biaya.*kuliah',
+            r'alur.*bayar.*kuliah',
+            r'prosedur.*bayar.*kuliah',
+            r'tata.*cara.*bayar.*kuliah',
+            r'bayar.*kuliah.*bisa.*dengan.*apa.*saja',
+            r'bayar.*kuliah.*bisa.*apa.*saja',
+            r'bayar.*kuliah.*pakai.*apa.*saja',
+            r'metode.*bayar.*kuliah',
+            r'metode.*pembayaran.*kuliah',
+            r'pembayaran.*kuliah.*bisa.*lewat.*apa',
+            r'opsi.*bayar.*kuliah',
+        ]
+    },
+    {
+        'id': 'K4',
+        'nama': 'Histori Pembayaran Akademik',
+        'target_judul': 'Petunjuk Histori Pembayaran Akademik',
+        'pola': [
+            r'cara.*lihat.*histori.*pembayaran',
+            r'cara.*cek.*riwayat.*pembayaran',
+            r'lihat.*riwayat.*bayar',
+            r'cek.*histori.*pembayaran',
+            r'melihat.*riwayat.*pembayaran',
+            r'cek.*riwayat.*pembayaran',
+            r'lihat.*histori.*pembayaran',
+            r'histori.*pembayaran.*akademik',
+            r'riwayat.*pembayaran.*akademik',
+            r'melihat.*histori.*transaksi',
+        ]
+    },
+    {
+        'id': 'K3',
+        'nama': 'Petunjuk Pembayaran Biaya Mutasi',
+        'target_judul': 'Petunjuk Pembayaran Biaya Mutasi',
+        'pola': [
+            r'petunjuk.*pembayaran.*biaya.*mutasi',
+            r'petunjuk.*bayar.*mutasi',
+            r'cara.*bayar.*mutasi',
+            r'cara.*membayar.*mutasi',
+            r'panduan.*bayar.*biaya.*mutasi',
+            r'panduan.*bayar.*mutasi',
+            r'langkah.*bayar.*mutasi',
+            r'prosedur.*bayar.*mutasi',
+        ]
+    },
+    {
+        'id': 'K2',
+        'nama': 'Petunjuk Pembayaran Biaya Cuti',
+        'target_judul': 'Petunjuk Pembayaran Biaya Cuti',
+        'pola': [
+            r'petunjuk.*pembayaran.*biaya.*cuti',
+            r'petunjuk.*bayar.*cuti',
+            r'cara.*bayar.*cuti',
+            r'cara.*membayar.*cuti',
+            r'panduan.*bayar.*biaya.*cuti',
+            r'panduan.*bayar.*cuti',
+            r'langkah.*bayar.*cuti',
+            r'prosedur.*bayar.*cuti',
+        ]
+    }
+]
+
+
+def is_kueri_riwayat_pembayaran(teks: str) -> bool:
+    """Mendeteksi apakah pertanyaan menanyakan histori/riwayat, bukan mengirimkan bukti bayar."""
+    t = teks.lower()
+    return bool(re.search(r'\b(histori|history|riwayat)\b', t) and any(k in t for k in ['bayar', 'pembayaran', 'transaksi', 'kuliah', 'spp', 'tagihan']))
+
+
+def cocokkan_segmen_aturan(pesan_normal: str) -> dict | None:
+    """Mencocokkan frasa pertanyaan dengan segmen spesifik Dokumen Panduan BSI.ID."""
+    matches = []
+    for r in SEGMEN_ATURAN_LIST:
+        for p in r['pola']:
+            if re.search(p, pesan_normal):
+                matches.append(r)
+                break
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def eksekusi_jawaban_segmen_aturan(pesan_normal: str, rule_segmen: dict, susunan: str = "V1", mulai_waktu: float = None) -> tuple[bool, dict]:
+    """Mengambil dokumen resmi langsung dari basis data untuk segmen aturan dan memvalidasi leksikal."""
+    if mulai_waktu is None:
+        mulai_waktu = time.perf_counter()
+
+    col = get_chroma_collection()
+    target_judul = rule_segmen['target_judul']
+
+    res_db = col.get(where={"judul_bagian": target_judul})
+    if not res_db or not res_db['documents']:
+        return False, {'alasan': f"Dokumen chunk untuk '{target_judul}' tidak ditemukan di basis data."}
+
+    doc_text = res_db['documents'][0]
+    meta = res_db['metadatas'][0]
+    nama_sumber = meta.get('nama_berkas', 'Penjelasan_Fitur_EKTM_BSI_ID_Lengkap update.docx')
+    tgl_berlaku = meta.get('tanggal_berlaku', '2026-11-09')
+    judul_bagian = meta.get('judul_bagian', target_judul)
+    sumber_str = f"{nama_sumber} (Bagian: {judul_bagian}, dimasukkan ke indeks: {tgl_berlaku})"
+
+    kata_isi = ekstrak_kata_isi(pesan_normal)
+    doc_cek = doc_text.lower().replace('e-ktm', 'ektm').replace('-', ' ')
+    if kata_isi:
+        kata_cocok = [k for k in kata_isi if re.search(r'\b' + re.escape(k) + r'\b', doc_cek)]
+        overlap = round(len(kata_cocok) / len(kata_isi), 3)
     else:
-        susunan = susunan.strip().upper()
+        overlap = 1.0
 
-    # 1. Normalisasi
-    pesan_normal = normalisasi(pesan)
-
-    # 2. Router
-    info_router = klasifikasi_router_detail(pesan_normal, mode=router_mode)
-    kelas_router = info_router['kelas']
-    keyakinan = info_router['keyakinan']
-    peluang_eskalasi = info_router.get('peluang_eskalasi', 0.0)
-    keputusan_router = info_router.get('keputusan', 'jawab')
-
-    # 3. Pengecekan aturan penolakan / topik terlarang (Keamanan Pertama untuk SEMUA susunan)
-    terlarang, alasan_terlarang = periksa_topik_terlarang(pesan_normal)
-    if terlarang:
-        waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
-        return {
-            'jawaban': (
-                f"Mohon maaf, pertanyaan Anda tidak dapat dijawab secara otomatis oleh sistem. "
-                f"{alasan_terlarang} "
-                f"Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
-            ),
-            'sumber': "",
-            'kelas_router': kelas_router,
-            'keyakinan': keyakinan,
-            'peluang_eskalasi': peluang_eskalasi,
-            'keputusan_router': keputusan_router,
-            'jarak_terbaik': None,
-            'tumpang_tindih_kata': None,
-            'skor_gabungan': None,
-            'susunan': susunan,
-            'kata_isi': [],
-            'keputusan': "teruskan_ke_staf",
-            'alasan': f"Topik terlarang / kebijakan eskalasi: {alasan_terlarang}",
-            'dialihkan_oleh': "aturan",
-            'potongan_terpakai': [],
-            'waktu_ms': waktu_ms,
+    if overlap < MIN_OVERLAP_KATA:
+        return False, {
+            'alasan': f"Frasa cocok dengan segmen {rule_segmen['id']}, namun overlap kata isi ({overlap:.2f}) < {MIN_OVERLAP_KATA:.2f}",
+            'tumpang_tindih_kata': overlap
         }
 
-    # 4. Penanganan khusus Bukti Bayar (Keamanan Pertama untuk SEMUA susunan)
-    # Bot TIDAK membaca gambar dan TIDAK mengklaim menerima atau meneruskan
-    if kelas_router == "bukti_bayar":
-        cek_bukti = periksa_kelengkapan_bukti_bayar(pesan_normal)
-        waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
+    teks_jawaban = format_jawaban_manusiawi(doc_text.strip(), meta, pesan_normal)
+    waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
 
-        if cek_bukti['status_lengkap']:
-            teks_status = (
-                f"Silakan kirim bukti pembayaran beserta keterangan tersebut ke admin "
-                f"lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
-            )
-        else:
-            kurang = ", ".join(cek_bukti['field_hilang'])
-            teks_status = (
-                f"Keterangan bukti pembayaran Anda belum lengkap. Keterangan yang belum tercantum: {kurang}. "
-                f"Silakan kirim bukti pembayaran beserta keterangan tersebut ke admin "
-                f"lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
-            )
+    potongan_list = [{
+        'teks': doc_text,
+        'jarak': 0.0,
+        'metadata': meta,
+    }]
 
-        return {
-            'jawaban': teks_status,
-            'sumber': "",
-            'kelas_router': kelas_router,
-            'keyakinan': keyakinan,
-            'peluang_eskalasi': peluang_eskalasi,
-            'keputusan_router': keputusan_router,
-            'jarak_terbaik': None,
-            'tumpang_tindih_kata': None,
-            'skor_gabungan': None,
-            'susunan': susunan,
-            'kata_isi': [],
-            'keputusan': "teruskan_ke_staf",
-            'alasan': "Bukti bayar tidak dibaca otomatis oleh bot; diperiksa kelengkapan teks dan diarahkan ke admin.",
-            'dialihkan_oleh': "aturan",
-            'potongan_terpakai': [],
-            'waktu_ms': waktu_ms,
-        }
+    return True, {
+        'jawaban': teks_jawaban,
+        'sumber': sumber_str,
+        'kelas_router': 'aturan_segmen',
+        'keyakinan': 1.0,
+        'peluang_eskalasi': 0.0,
+        'keputusan_router': 'jawab',
+        'jarak_terbaik': 0.0,
+        'tumpang_tindih_kata': overlap,
+        'skor_gabungan': 1.0,
+        'susunan': susunan,
+        'kata_isi': kata_isi,
+        'keputusan': "jawab",
+        'alasan': f"Aturan segmen {rule_segmen['id']} ({target_judul}) cocok jelas dan overlap leksikal ({overlap:.2f}) >= {MIN_OVERLAP_KATA:.2f}.",
+        'dialihkan_oleh': "-",
+        'potongan_terpakai': potongan_list,
+        'waktu_ms': waktu_ms,
+    }
 
-    # 5. Evaluasi Keputusan Router (Eskalasi Otomatis)
-    # Pada susunan V1 dan V3: router memblokir di depan jika keputusan_router == "teruskan"
-    # Pada susunan V2: pencarian jalan dulu, router bertindak sebagai veto setelah pencarian
-    if susunan in ["V1", "V3"] and keputusan_router == "teruskan":
-        waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
-        active_mode = router_mode if router_mode else ROUTER_AKTIF.strip().lower()
-        if active_mode == "indobertweet":
-            alasan_esk = f"Router IndoBERTweet: kelas '{kelas_router}' (keyakinan: {keyakinan:.2f}) atau peluang eskalasi ({peluang_eskalasi:.4f}) mencapai ambang."
-        elif active_mode == "klasik":
-            alasan_esk = f"Router Klasik: kelas '{kelas_router}' (keyakinan: {keyakinan:.2f}) atau peluang eskalasi ({peluang_eskalasi:.4f}) mencapai ambang."
-        else:
-            alasan_esk = f"Router Aturan: kelas eskalasi ('{kelas_router}') atau keyakinan ({keyakinan:.2f}) di bawah ambang ({ROUTER_CONFIDENCE_THRESHOLD})."
 
-        return {
-            'jawaban': (
-                f"Pertanyaan Anda berada di luar cakupan informasi otomatis bot "
-                f"atau memerlukan penanganan khusus. "
-                f"Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
-            ),
-            'sumber': "",
-            'kelas_router': kelas_router,
-            'keyakinan': keyakinan,
-            'peluang_eskalasi': peluang_eskalasi,
-            'keputusan_router': keputusan_router,
-            'jarak_terbaik': None,
-            'tumpang_tindih_kata': None,
-            'skor_gabungan': None,
-            'susunan': susunan,
-            'kata_isi': [],
-            'keputusan': "teruskan_ke_staf",
-            'alasan': alasan_esk,
-            'dialihkan_oleh': "router",
-            'potongan_terpakai': [],
-            'waktu_ms': waktu_ms,
-        }
+KANAL_TERDAFTAR_VA = {"motionbank", "indomaret", "alfamart", "bca", "permata", "mandiri", "bni", "bri", "bsi"}
+KANAL_DENGAN_LANGKAH_RINCI = {"bri", "indomaret", "alfamart", "bca", "mandiri", "bni", "permata", "bsi"}
 
-    # 6. Pencarian di Chroma DB untuk kelas yang diizinkan (pembayaran_umum, kegiatan_pmb, login_akun)
+def eksekusi_pencarian_dan_gerbang(pesan_normal: str, susunan: str, kls_router: str, conf_router: float, p_esk: float, mulai_waktu: float) -> tuple[bool, dict]:
+    """
+    Menjalankan alur pencarian Chroma DB dan verifikasi gerbang leksikal/keamanan untuk Sistem B.
+    Mengembalikan (sukses: bool, data_hasil: dict).
+    """
     try:
         col = get_chroma_collection()
         embedder = get_embedding_model()
 
-        # Awalan passage/query untuk model multilingual-e5
         query_teks = EMBEDDING_PREFIX_QUERY + pesan_normal
         query_emb = embedder.encode([query_teks], normalize_embeddings=True)
 
@@ -783,14 +868,18 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
         )
     except Exception as e:
         waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
-        return {
+        return False, {
             'jawaban': f"Terjadi kendala teknis dalam pencarian basis pengetahuan. Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}.",
             'sumber': "",
-            'kelas_router': kelas_router,
-            'keyakinan': keyakinan,
-            'peluang_eskalasi': peluang_eskalasi,
-            'keputusan_router': keputusan_router,
+            'kelas_router': kls_router,
+            'keyakinan': conf_router,
+            'peluang_eskalasi': p_esk,
+            'keputusan_router': "teruskan",
             'jarak_terbaik': None,
+            'tumpang_tindih_kata': None,
+            'skor_gabungan': None,
+            'susunan': susunan,
+            'kata_isi': [],
             'keputusan': "teruskan_ke_staf",
             'alasan': f"Galat basis data Chroma: {e}",
             'potongan_terpakai': [],
@@ -801,15 +890,11 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
     distances_raw = hasil_cari.get('distances', [[]])[0]
     metadatas_raw = hasil_cari.get('metadatas', [[]])[0]
 
-    # Simpan 3 potongan teratas sebelum filter aturan topik khusus (untuk evaluasi & log)
     kandidat_sebelum_filter = [
         (metadatas_raw[i].get('jejak_judul', ''), float(distances_raw[i]))
         for i in range(min(3, len(distances_raw)))
     ]
 
-    # Filter Bagian Topik Khusus (Perbaikan 1):
-    # Bagian yang khusus satu topik/prodi/kegiatan (Keperawatan, Kursus Bahasa, Jaket KIP, Skripsi/TA,
-    # Skripsi/TA Perbaikan, Wisuda, Seminar SWE, Her) hanya boleh dipakai jika pertanyaan menyebut kata kuncinya.
     docs = []
     distances = []
     metadatas = []
@@ -828,13 +913,12 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
         if perlu_kw:
             ada_kw = any(re.search(r'\b' + re.escape(kw) + r'\b', pesan_normal) for kw in kws_wajib)
             if not ada_kw:
-                continue  # Singkirkan bagian itu dari kandidat
+                continue
 
         docs.append(d)
         distances.append(dist)
         metadatas.append(meta)
 
-    # Prioritaskan potongan yang judul bagiannya secara eksplisit cocok dengan kanal pembayaran yang ditanyakan
     kanal_disebut = []
     for k in KANAL_PEMBAYARAN:
         if k == "bsi":
@@ -859,7 +943,6 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
             distances = [k[1] for k in gabung]
             metadatas = [k[2] for k in gabung]
 
-    # Prioritaskan potongan yang memuat klausul 'definisi' secara eksplisit jika ditanyakan definisi/arti
     if re.search(r'\b(definisi|pengertian|arti)\b', pesan_normal):
         kandidat_def = []
         kandidat_non_def = []
@@ -874,12 +957,10 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
             distances = [k[1] for k in gabung]
             metadatas = [k[2] for k in gabung]
 
-    # Ambil maksimal TOP_K_RESULTS
     docs = docs[:TOP_K_RESULTS]
     distances = distances[:TOP_K_RESULTS]
     metadatas = metadatas[:TOP_K_RESULTS]
 
-    # Simpan 3 potongan teratas setelah filter aturan topik khusus & prioritas kanal
     kandidat_setelah_filter = [
         (metadatas[i].get('jejak_judul', ''), float(distances[i]))
         for i in range(min(3, len(distances)))
@@ -887,14 +968,18 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
 
     if not docs or not distances:
         waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
-        return {
+        return False, {
             'jawaban': f"Informasi yang Anda cari tidak ditemukan dalam dokumen resmi kampus. Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}.",
             'sumber': "",
-            'kelas_router': kelas_router,
-            'keyakinan': keyakinan,
-            'peluang_eskalasi': peluang_eskalasi,
-            'keputusan_router': keputusan_router,
+            'kelas_router': kls_router,
+            'keyakinan': conf_router,
+            'peluang_eskalasi': p_esk,
+            'keputusan_router': "teruskan",
             'jarak_terbaik': None,
+            'tumpang_tindih_kata': None,
+            'skor_gabungan': None,
+            'susunan': susunan,
+            'kata_isi': [],
             'keputusan': "teruskan_ke_staf",
             'alasan': "Tidak ada dokumen yang relevan setelah penyaringan topik khusus.",
             'potongan_terpakai': [],
@@ -912,27 +997,26 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
             'metadata': meta,
         })
 
-    # Pada susunan V2: Router hanya menjadi veto jika P(eskalasi) >= AMBANG_VETO_V2
-    if susunan == "V2" and peluang_eskalasi >= AMBANG_VETO_V2:
+    if susunan == "V2" and p_esk >= AMBANG_VETO_V2:
         waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
-        return {
+        return False, {
             'jawaban': (
                 f"Pertanyaan Anda berada di luar cakupan informasi otomatis bot "
                 f"atau memerlukan penanganan khusus. "
                 f"Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
             ),
             'sumber': "",
-            'kelas_router': kelas_router,
-            'keyakinan': keyakinan,
-            'peluang_eskalasi': peluang_eskalasi,
-            'keputusan_router': keputusan_router,
+            'kelas_router': kls_router,
+            'keyakinan': conf_router,
+            'peluang_eskalasi': p_esk,
+            'keputusan_router': "teruskan",
             'jarak_terbaik': jarak_terbaik,
             'tumpang_tindih_kata': None,
             'skor_gabungan': None,
             'susunan': susunan,
             'kata_isi': [],
             'keputusan': "teruskan_ke_staf",
-            'alasan': f"Veto Router V2: peluang eskalasi ({peluang_eskalasi:.4f}) mencapai ambang veto ({AMBANG_VETO_V2}).",
+            'alasan': f"Veto Router V2: peluang eskalasi ({p_esk:.4f}) mencapai ambang veto ({AMBANG_VETO_V2}).",
             'dialihkan_oleh': "router",
             'potongan_terpakai': potongan_list,
             'kandidat_sebelum_filter': kandidat_sebelum_filter,
@@ -940,19 +1024,18 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
             'waktu_ms': waktu_ms,
         }
 
-    # 7. Evaluasi jarak terbaik vs ambang batas (V1 dan V2)
     if susunan in ["V1", "V2"] and jarak_terbaik > SEARCH_DISTANCE_THRESHOLD:
         waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
-        return {
+        return False, {
             'jawaban': (
                 f"Informasi mengenai hal tersebut belum tercantum dengan jelas pada dokumen resmi kampus. "
                 f"Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
             ),
             'sumber': "",
-            'kelas_router': kelas_router,
-            'keyakinan': keyakinan,
-            'peluang_eskalasi': peluang_eskalasi,
-            'keputusan_router': keputusan_router,
+            'kelas_router': kls_router,
+            'keyakinan': conf_router,
+            'peluang_eskalasi': p_esk,
+            'keputusan_router': "teruskan",
             'jarak_terbaik': jarak_terbaik,
             'tumpang_tindih_kata': None,
             'skor_gabungan': None,
@@ -967,18 +1050,13 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
             'waktu_ms': waktu_ms,
         }
 
-    # --- 8. GERBANG KEDUA (LEKSIKAL): Entitas Kanal & Tumpang Tindih Kata Isi ---
     teks_teratas = docs[0]
     teks_teratas_l = teks_teratas.lower()
     meta_top = metadatas[0]
     nama_sumber = meta_top.get('nama_berkas', 'Penjelasan_Fitur_EKTM_BSI_ID_Lengkap update.docx')
     tgl_berlaku = meta_top.get('tanggal_berlaku', '2026-11-09')
 
-    # a. Ekstrak kata isi dari pertanyaan
     kata_isi = ekstrak_kata_isi(pesan_normal)
-
-    # b. Hitung proporsi kata isi yang muncul di potongan teratas
-    # Catatan: Samakan representasi 'e-ktm' dan 'ektm' agar variasi penulisan kartu mahasiswa cocok secara leksikal
     teks_teratas_cek = teks_teratas_l.replace('e-ktm', 'ektm').replace('-', ' ')
     if kata_isi:
         kata_cocok = [k for k in kata_isi if re.search(r'\b' + re.escape(k) + r'\b', teks_teratas_cek)]
@@ -987,38 +1065,19 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
         kata_cocok = []
         tumpang_tindih = 1.0
 
-    # c. Aturan Entitas: Kanal Pembayaran / Bank (Wajib untuk SEMUA susunan)
-    # Kanal yang tercantum dalam daftar Virtual Account pada dokumen resmi:
-    KANAL_TERDAFTAR_VA = {"motionbank", "indomaret", "alfamart", "bca", "permata", "mandiri", "bni", "bri", "bsi"}
-    # Kanal yang memiliki rincian langkah pembayaran lengkap di dokumen resmi:
-    KANAL_DENGAN_LANGKAH_RINCI = {"bri", "indomaret", "alfamart", "bca", "mandiri", "bni", "permata", "bsi"}
-
-    # "BSI.ID" dan "BSI Pay" adalah nama aplikasi, bukan kanal bank.
-    # Kecualikan keduanya dari aturan entitas kanal;
-    # kanal bank BSI hanya jika pertanyaan memuat pola seperti "bank bsi", "va bsi", atau "transfer bsi".
-    kanal_disebut = []
-    for k in KANAL_PEMBAYARAN:
-        if k == "bsi":
-            if re.search(r'\b(bank bsi|va bsi|transfer bsi|atm bsi|teller bsi|mbanking bsi|m-banking bsi|rekening bsi|setor bsi)\b', pesan_normal):
-                kanal_disebut.append("bsi")
-        else:
-            if re.search(r'\b' + re.escape(k) + r'\b', pesan_normal):
-                kanal_disebut.append(k)
-
-    # Pengecualian khusus dokumen: ATM Mandiri tidak tersedia (catatan dokumen: tanyakan ke admin)
     if "mandiri" in kanal_disebut and re.search(r'\b(atm mandiri|transfer atm mandiri)\b', pesan_normal):
         waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
-        return {
+        return False, {
             'jawaban': (
                 f"Panduan langkah pembayaran melalui Transfer ATM Mandiri saat ini belum tersedia di sistem "
                 f"(sesuai catatan dokumen resmi, silakan hubungi admin atau gunakan aplikasi Livin by Mandiri). "
                 f"Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
             ),
             'sumber': f"{nama_sumber} (dimasukkan ke indeks: {tgl_berlaku})",
-            'kelas_router': kelas_router,
-            'keyakinan': keyakinan,
-            'peluang_eskalasi': peluang_eskalasi,
-            'keputusan_router': keputusan_router,
+            'kelas_router': kls_router,
+            'keyakinan': conf_router,
+            'peluang_eskalasi': p_esk,
+            'keputusan_router': "teruskan",
             'jarak_terbaik': jarak_terbaik,
             'tumpang_tindih_kata': tumpang_tindih,
             'skor_gabungan': None,
@@ -1034,12 +1093,9 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
         }
 
     kanal_tanpa_langkah = [k for k in kanal_disebut if k not in KANAL_DENGAN_LANGKAH_RINCI]
-
     if kanal_tanpa_langkah:
         waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
         daftar_kanal = ", ".join([k.upper() for k in kanal_tanpa_langkah])
-
-        # Sesuai prompt: jika kanal disebut di daftar metode tapi langkah rincinya belum ada:
         if any(k in KANAL_TERDAFTAR_VA for k in kanal_tanpa_langkah):
             teks_kanal = (
                 f"{daftar_kanal} tersedia sebagai pilihan Virtual Account "
@@ -1055,13 +1111,13 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
             )
             alasan_kanal = f"Kanal '{daftar_kanal}' tidak tercantum dalam dokumen rujukan resmi."
 
-        return {
+        return False, {
             'jawaban': teks_kanal,
             'sumber': f"{nama_sumber} (dimasukkan ke indeks: {tgl_berlaku})",
-            'kelas_router': kelas_router,
-            'keyakinan': keyakinan,
-            'peluang_eskalasi': peluang_eskalasi,
-            'keputusan_router': keputusan_router,
+            'kelas_router': kls_router,
+            'keyakinan': conf_router,
+            'peluang_eskalasi': p_esk,
+            'keputusan_router': "teruskan",
             'jarak_terbaik': jarak_terbaik,
             'tumpang_tindih_kata': tumpang_tindih,
             'skor_gabungan': None,
@@ -1076,21 +1132,20 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
             'waktu_ms': waktu_ms,
         }
 
-    # d. Evaluasi Ambang Proporsi Tumpang Tindih (V1 & V2) atau Skor Gabungan (V3)
     skor_gabungan = None
     if susunan in ["V1", "V2"]:
         if tumpang_tindih < MIN_OVERLAP_KATA:
             waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
-            return {
+            return False, {
                 'jawaban': (
                     f"Informasi mengenai hal tersebut belum tercantum dengan jelas pada dokumen resmi kampus. "
                     f"Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
                 ),
                 'sumber': "",
-                'kelas_router': kelas_router,
-                'keyakinan': keyakinan,
-                'peluang_eskalasi': peluang_eskalasi,
-                'keputusan_router': keputusan_router,
+                'kelas_router': kls_router,
+                'keyakinan': conf_router,
+                'peluang_eskalasi': p_esk,
+                'keputusan_router': "teruskan",
                 'jarak_terbaik': jarak_terbaik,
                 'tumpang_tindih_kata': tumpang_tindih,
                 'skor_gabungan': None,
@@ -1109,23 +1164,23 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
         skor_gabungan = round(0.5 * sim_kosinus + 0.5 * tumpang_tindih, 4)
         if skor_gabungan < AMBANG_V3:
             waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
-            return {
+            return False, {
                 'jawaban': (
                     f"Informasi mengenai hal tersebut belum tercantum dengan jelas pada dokumen resmi kampus. "
                     f"Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
                 ),
                 'sumber': "",
-                'kelas_router': kelas_router,
-                'keyakinan': keyakinan,
-                'peluang_eskalasi': peluang_eskalasi,
-                'keputusan_router': keputusan_router,
+                'kelas_router': kls_router,
+                'keyakinan': conf_router,
+                'peluang_eskalasi': p_esk,
+                'keputusan_router': "teruskan",
                 'jarak_terbaik': jarak_terbaik,
                 'tumpang_tindih_kata': tumpang_tindih,
                 'skor_gabungan': skor_gabungan,
                 'susunan': susunan,
                 'kata_isi': kata_isi,
                 'keputusan': "teruskan_ke_staf",
-                'alasan': f"Skor gabungan V3 ({skor_gabungan:.3f} = 0.5*(1-{jarak_terbaik:.3f}) + 0.5*{tumpang_tindih:.2f}) di bawah ambang batas ({AMBANG_V3}).",
+                'alasan': f"Skor gabungan V3 ({skor_gabungan:.3f}) di bawah ambang batas ({AMBANG_V3}).",
                 'dialihkan_oleh': "gerbang",
                 'potongan_terpakai': potongan_list,
                 'kandidat_sebelum_filter': kandidat_sebelum_filter,
@@ -1133,21 +1188,19 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
                 'waktu_ms': waktu_ms,
             }
 
-    # --- 9. Cek karantina, tanggal kedaluwarsa, biaya, dan status pada potongan teratas ---
     judul_bagian = meta_top.get('judul_bagian', '')
     jejak_judul = meta_top.get('jejak_judul', '')
     sumber_str = f"{nama_sumber} (Bagian: {judul_bagian}, dimasukkan ke indeks: {tgl_berlaku})"
 
-    # Cek Karantina Bagian (K-017)
     if any(k.lower() in judul_bagian.lower() or k.lower() in jejak_judul.lower() for k in KARANTINA_BAGIAN):
         waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
-        return {
+        return False, {
             'jawaban': f"Informasi terkait bagian ini sedang dalam karantina kebijakan. Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}.",
             'sumber': sumber_str,
-            'kelas_router': kelas_router,
-            'keyakinan': keyakinan,
-            'peluang_eskalasi': peluang_eskalasi,
-            'keputusan_router': keputusan_router,
+            'kelas_router': kls_router,
+            'keyakinan': conf_router,
+            'peluang_eskalasi': p_esk,
+            'keputusan_router': "teruskan",
             'jarak_terbaik': jarak_terbaik,
             'tumpang_tindih_kata': tumpang_tindih,
             'skor_gabungan': skor_gabungan,
@@ -1162,7 +1215,6 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
     sudah_tutup, alasan_tgl, tgl_tutup_str = periksa_tanggal_kedaluwarsa_teks(meta_top)
     teks_jawaban = docs[0].strip()
 
-    # Cek apakah pertanyaan menanyakan apakah masih dibuka / masih bisa daftar / status buka
     tanya_status_buka = any(k in pesan_normal for k in [
         'masih buka', 'masih dibuka', 'masih bisa', 'apakah bisa', 'bisa daftar',
         'kapan tutup', 'sudah tutup', 'jadwal buka', 'jadwal pendaftaran'
@@ -1176,13 +1228,13 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
                 f"Status 'TERBUKA' yang sebelumnya tercantum pada dokumen panduan aplikasi sudah tidak berlaku per tanggal hari ini ({TANGGAL_HARI_INI}). "
                 f"Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
             )
-            return {
+            return False, {
                 'jawaban': jawaban_tegas,
                 'sumber': sumber_str,
-                'kelas_router': kelas_router,
-                'keyakinan': keyakinan,
-                'peluang_eskalasi': peluang_eskalasi,
-                'keputusan_router': keputusan_router,
+                'kelas_router': kls_router,
+                'keyakinan': conf_router,
+                'peluang_eskalasi': p_esk,
+                'keputusan_router': "teruskan",
                 'jarak_terbaik': jarak_terbaik,
                 'tumpang_tindih_kata': tumpang_tindih,
                 'skor_gabungan': skor_gabungan,
@@ -1195,15 +1247,14 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
                 'waktu_ms': waktu_ms,
             }
         elif not tgl_tutup_str:
-            # Dokumen aktif tidak memuat tanggal tutup -> gunakan template resmi Story WhatsApp
             waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
-            return {
+            return False, {
                 'jawaban': f"Status pembayaran kegiatan berubah sesuai jadwal dan diumumkan lewat Story WhatsApp admin. Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}.",
                 'sumber': sumber_str,
-                'kelas_router': kelas_router,
-                'keyakinan': keyakinan,
-                'peluang_eskalasi': peluang_eskalasi,
-                'keputusan_router': keputusan_router,
+                'kelas_router': kls_router,
+                'keyakinan': conf_router,
+                'peluang_eskalasi': p_esk,
+                'keputusan_router': "teruskan",
                 'jarak_terbaik': jarak_terbaik,
                 'tumpang_tindih_kata': tumpang_tindih,
                 'skor_gabungan': skor_gabungan,
@@ -1216,32 +1267,19 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
                 'waktu_ms': waktu_ms,
             }
 
-    if sudah_tutup:
-        teks_jawaban = re.sub(
-            r'Status:\s*TERBUKA',
-            f"Status: SUDAH DITUTUP (Batas akhir pembayaran/pendaftaran adalah {tgl_tutup_str} dan telah terlewati per tanggal hari ini, {TANGGAL_HARI_INI})",
-            teks_jawaban,
-            flags=re.IGNORECASE
-        )
-        teks_jawaban += (
-            f"\n\n[PERINGATAN SISTEM: Batas waktu pembayaran/pendaftaran untuk kegiatan ini telah berakhir pada tanggal {tgl_tutup_str}. "
-            f"Status saat ini SUDAH DITUTUP per tanggal hari ini ({TANGGAL_HARI_INI}).]"
-        )
-
-    # Cek biaya kegiatan (angka biaya kegiatan tidak boleh ditampilkan ke mahasiswa)
     is_kegiatan = any(k in jejak_judul.lower() for k in [
         'kegiatan', 'seminar', 'wisuda', 'serkom', 'workshop', 'jaket', 'rincian kategori pembayaran akademik'
     ])
     tanya_biaya = any(k in pesan_normal for k in ['biaya', 'tarif', 'harga', 'bayar berapa', 'berapa biaya', 'nominal'])
     if (meta_top.get('memuat_biaya') == 'ya' and is_kegiatan and tanya_biaya) or (is_kegiatan and tanya_biaya):
         waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
-        return {
+        return False, {
             'jawaban': f"Informasi mengenai angka atau rincian biaya kegiatan tidak ditampilkan secara otomatis oleh bot. Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}.",
             'sumber': sumber_str,
-            'kelas_router': kelas_router,
-            'keyakinan': keyakinan,
-            'peluang_eskalasi': peluang_eskalasi,
-            'keputusan_router': keputusan_router,
+            'kelas_router': kls_router,
+            'keyakinan': conf_router,
+            'peluang_eskalasi': p_esk,
+            'keputusan_router': "teruskan",
             'jarak_terbaik': jarak_terbaik,
             'tumpang_tindih_kata': tumpang_tindih,
             'skor_gabungan': skor_gabungan,
@@ -1254,20 +1292,17 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
             'waktu_ms': waktu_ms,
         }
 
-    # Bersihkan kalimat klaim status saat ini (Perbaikan 2)
     teks_jawaban = bersihkan_klaim_status_saat_ini(teks_jawaban)
-
-    # Format percakapan ramah & manusiawi (Conversational Framing)
     teks_jawaban = format_jawaban_manusiawi(teks_jawaban, meta_top, pesan_normal)
 
     waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
-    return {
+    return True, {
         'jawaban': teks_jawaban,
         'sumber': sumber_str,
-        'kelas_router': kelas_router,
-        'keyakinan': keyakinan,
-        'peluang_eskalasi': peluang_eskalasi,
-        'keputusan_router': keputusan_router,
+        'kelas_router': kls_router,
+        'keyakinan': conf_router,
+        'peluang_eskalasi': p_esk,
+        'keputusan_router': "jawab",
         'jarak_terbaik': jarak_terbaik,
         'tumpang_tindih_kata': tumpang_tindih,
         'skor_gabungan': skor_gabungan,
@@ -1279,6 +1314,357 @@ def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> 
         'potongan_terpakai': potongan_list,
         'kandidat_sebelum_filter': kandidat_sebelum_filter,
         'kandidat_setelah_filter': kandidat_setelah_filter,
+        'waktu_ms': waktu_ms,
+    }
+
+
+# ==============================================================
+# FUNGSI UTAMA BOT (SISTEM B CASCADE)
+# ==============================================================
+
+def jawab_sistem_b(pesan: str, router_mode: str = None, susunan: str = None) -> dict:
+    """
+    Implementasi penalaran Sistem B dengan CASCADE OTOMATIS:
+    Langkah 0: Gerbang Keras Keamanan (Topik Terlarang, Bukti Bayar, Beasiswa) -> Teruskan Admin (Bypass Cascade)
+    Langkah 1: Router IndoBERTweet (Ambang T = 0.100) -> Jawab jika lolos gerbang leksikal, eskalasi jika gagal
+    Langkah 2: Router Klasik TF-IDF (Ambang T = 0.300, lazy loaded) -> Jawab jika lolos gerbang leksikal, eskalasi jika gagal
+    Langkah 3: Router Aturan Segmen Panduan BSI.ID -> Jawab jika cocok segmen dan overlap kata isi >= 50%
+    Fallback : Jika ketiganya meneruskan, barulah chatbot memberikan jawaban penolakan ramah dan meneruskan ke admin.
+    """
+    mulai_waktu = time.perf_counter()
+
+    if susunan is None:
+        susunan = SUSUNAN_AKTIF.strip().upper()
+    else:
+        susunan = susunan.strip().upper()
+
+    pesan_normal = normalisasi(pesan)
+
+    # ------------------------------------------------------------------
+    # LANGKAH 0: GERBANG KERAS (KEAMANAN PERTAMA — TIDAK BOLEH DI-CASCADE)
+    # ------------------------------------------------------------------
+    terlarang, alasan_terlarang = periksa_topik_terlarang(pesan_normal)
+    if terlarang:
+        waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
+        return {
+            'jawaban': (
+                f"Mohon maaf, pertanyaan Anda tidak dapat dijawab secara otomatis oleh sistem. "
+                f"{alasan_terlarang} "
+                f"Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
+            ),
+            'sumber': "",
+            'kelas_router': "topik_terlarang",
+            'keyakinan': 1.0,
+            'peluang_eskalasi': 1.0,
+            'keputusan_router': "teruskan",
+            'router_penjawab': "tidak_ada",
+            'telemetri_cascade': {
+                'gerbang_keras': f"Topik terlarang / keamanan aktif: {alasan_terlarang}",
+                'indobertweet': {'status': 'dilewati', 'alasan': 'Gerbang keras keamanan aktif di Langkah 0'},
+                'klasik': {'status': 'dilewati', 'alasan': 'Gerbang keras keamanan aktif di Langkah 0'},
+                'aturan': {'status': 'dilewati', 'alasan': 'Gerbang keras keamanan aktif di Langkah 0'},
+                'router_penjawab': 'tidak_ada'
+            },
+            'jarak_terbaik': None,
+            'tumpang_tindih_kata': None,
+            'skor_gabungan': None,
+            'susunan': susunan,
+            'kata_isi': [],
+            'keputusan': "teruskan_ke_staf",
+            'alasan': f"Topik terlarang / kebijakan eskalasi: {alasan_terlarang}",
+            'dialihkan_oleh': "aturan",
+            'potongan_terpakai': [],
+            'waktu_ms': waktu_ms,
+        }
+
+    is_tanya_histori = is_kueri_riwayat_pembayaran(pesan_normal)
+    pola_bukti_keras = [
+        'bukti transfer', 'bukti bayar', 'sudah transfer', 'sudah bayar dan kirim',
+        'struk transfer', 'struk pembayaran', 'lampiran transfer', 'ss transfer',
+        'screenshoot transfer', 'screenshot bukti', 'berikut bukti'
+    ]
+    is_bukti_keras = any(p in pesan_normal for p in pola_bukti_keras) or (
+        ('transfer' in pesan_normal or 'bayar' in pesan_normal) and 
+        ('nim' in pesan_normal or 'rp' in pesan_normal or 'norek' in pesan_normal)
+    )
+    if is_bukti_keras and not is_tanya_histori:
+        cek_bukti = periksa_kelengkapan_bukti_bayar(pesan_normal)
+        waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
+        if cek_bukti['status_lengkap']:
+            teks_status = (
+                f"Silakan kirim bukti pembayaran beserta keterangan tersebut ke admin "
+                f"lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
+            )
+        else:
+            kurang = ", ".join(cek_bukti['field_hilang'])
+            teks_status = (
+                f"Keterangan bukti pembayaran Anda belum lengkap. Keterangan yang belum tercantum: {kurang}. "
+                f"Silakan kirim bukti pembayaran beserta keterangan tersebut ke admin "
+                f"lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
+            )
+        return {
+            'jawaban': teks_status,
+            'sumber': "",
+            'kelas_router': "bukti_bayar",
+            'keyakinan': 0.95,
+            'peluang_eskalasi': 0.0,
+            'keputusan_router': "teruskan",
+            'router_penjawab': "tidak_ada",
+            'telemetri_cascade': {
+                'gerbang_keras': "Bukti bayar aktif di Langkah 0",
+                'indobertweet': {'status': 'dilewati', 'alasan': 'Kanal bukti bayar wajib dialihkan ke staf'},
+                'klasik': {'status': 'dilewati', 'alasan': 'Kanal bukti bayar wajib dialihkan ke staf'},
+                'aturan': {'status': 'dilewati', 'alasan': 'Kanal bukti bayar wajib dialihkan ke staf'},
+                'router_penjawab': 'tidak_ada'
+            },
+            'jarak_terbaik': None,
+            'tumpang_tindih_kata': None,
+            'skor_gabungan': None,
+            'susunan': susunan,
+            'kata_isi': [],
+            'keputusan': "teruskan_ke_staf",
+            'alasan': "Bukti bayar tidak dibaca otomatis oleh bot; diperiksa kelengkapan teks dan diarahkan ke admin.",
+            'dialihkan_oleh': "aturan",
+            'potongan_terpakai': [],
+            'waktu_ms': waktu_ms,
+        }
+
+    # Jika pengguna memilih satu router spesifik secara manual (bukan cascade)
+    mode_str = (router_mode or "").strip().lower()
+    if mode_str in ["indobertweet", "klasik", "aturan"]:
+        # Eksekusi mode non-cascade manual
+        if mode_str == "aturan":
+            rule_segmen = cocokkan_segmen_aturan(pesan_normal)
+            if rule_segmen:
+                sukses, res = eksekusi_jawaban_segmen_aturan(pesan_normal, rule_segmen, susunan=susunan, mulai_waktu=mulai_waktu)
+                if sukses:
+                    res['router_penjawab'] = "aturan"
+                    return res
+            waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
+            return {
+                'jawaban': f"Pertanyaan Anda berada di luar cakupan informasi otomatis bot. Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}.",
+                'sumber': "",
+                'kelas_router': "lainnya",
+                'keyakinan': 0.0,
+                'peluang_eskalasi': 1.0,
+                'keputusan_router': "teruskan",
+                'router_penjawab': "tidak_ada",
+                'jarak_terbaik': None,
+                'tumpang_tindih_kata': None,
+                'skor_gabungan': None,
+                'susunan': susunan,
+                'kata_isi': [],
+                'keputusan': "teruskan_ke_staf",
+                'alasan': "Tidak cocok dengan aturan kata kunci segmen panduan.",
+                'dialihkan_oleh': "router",
+                'potongan_terpakai': [],
+                'waktu_ms': waktu_ms,
+            }
+
+        # indobertweet atau klasik tunggal
+        info_r = klasifikasi_router_detail(pesan_normal, mode=mode_str)
+        kls_r = info_r['kelas']
+        conf_r = info_r['keyakinan']
+        p_esk_r = info_r.get('peluang_eskalasi', 0.0)
+        ambang_r = 0.100 if mode_str == "indobertweet" else 0.300
+
+        if kls_r == "bukti_bayar" and not is_tanya_histori:
+            cek_bukti = periksa_kelengkapan_bukti_bayar(pesan_normal)
+            waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
+            kurang = ", ".join(cek_bukti['field_hilang']) if not cek_bukti['status_lengkap'] else ""
+            teks_status = (
+                f"Keterangan bukti pembayaran Anda belum lengkap. Keterangan yang belum tercantum: {kurang}. "
+                f"Silakan kirim bukti pembayaran beserta keterangan tersebut ke admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
+            ) if kurang else (
+                f"Silakan kirim bukti pembayaran beserta keterangan tersebut ke admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
+            )
+            return {
+                'jawaban': teks_status,
+                'sumber': "",
+                'kelas_router': kls_r,
+                'keyakinan': conf_r,
+                'peluang_eskalasi': p_esk_r,
+                'keputusan_router': "teruskan",
+                'router_penjawab': "tidak_ada",
+                'jarak_terbaik': None,
+                'tumpang_tindih_kata': None,
+                'skor_gabungan': None,
+                'susunan': susunan,
+                'kata_isi': [],
+                'keputusan': "teruskan_ke_staf",
+                'alasan': "Bukti bayar tidak dibaca otomatis oleh bot; diperiksa kelengkapan teks dan diarahkan ke admin.",
+                'dialihkan_oleh': "aturan",
+                'potongan_terpakai': [],
+                'waktu_ms': waktu_ms,
+            }
+
+        if kls_r in KELAS_ESKALASI or p_esk_r >= ambang_r or (kls_r == "bukti_bayar" and is_tanya_histori):
+            waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
+            return {
+                'jawaban': f"Pertanyaan Anda berada di luar cakupan informasi otomatis bot. Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}.",
+                'sumber': "",
+                'kelas_router': kls_r,
+                'keyakinan': conf_r,
+                'peluang_eskalasi': p_esk_r,
+                'keputusan_router': "teruskan",
+                'router_penjawab': "tidak_ada",
+                'jarak_terbaik': None,
+                'tumpang_tindih_kata': None,
+                'skor_gabungan': None,
+                'susunan': susunan,
+                'kata_isi': [],
+                'keputusan': "teruskan_ke_staf",
+                'alasan': f"Router {mode_str}: kelas '{kls_r}' (keyakinan: {conf_r:.2f}) atau peluang eskalasi ({p_esk_r:.4f}) >= {ambang_r}.",
+                'dialihkan_oleh': "router",
+                'potongan_terpakai': [],
+                'waktu_ms': waktu_ms,
+            }
+
+        sukses, res = eksekusi_pencarian_dan_gerbang(pesan_normal, susunan=susunan, kls_router=kls_r, conf_router=conf_r, p_esk=p_esk_r, mulai_waktu=mulai_waktu)
+        res['router_penjawab'] = mode_str if sukses else "tidak_ada"
+        return res
+
+    # ------------------------------------------------------------------
+    # CASCADE ROUTER OTOMATIS: 1) IndoBERTweet -> 2) TF-IDF Klasik -> 3) Aturan
+    # ------------------------------------------------------------------
+    telemetri_cascade = {
+        'indobertweet': {'status': '-', 'alasan': '-'},
+        'klasik': {'status': '-', 'alasan': '-'},
+        'aturan': {'status': '-', 'alasan': '-'},
+        'router_penjawab': 'tidak_ada'
+    }
+
+    # --- LANGKAH 1: ROUTER INDOBERTWEET (UTAMA) ---
+    info_bert = klasifikasi_router_detail(pesan_normal, mode="indobertweet")
+    kls_bert = info_bert['kelas']
+    conf_bert = info_bert['keyakinan']
+    p_esk_bert = info_bert.get('peluang_eskalasi', 0.0)
+
+    if kls_bert == "bukti_bayar" and not is_tanya_histori:
+        cek_bukti = periksa_kelengkapan_bukti_bayar(pesan_normal)
+        waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
+        kurang = ", ".join(cek_bukti['field_hilang']) if not cek_bukti['status_lengkap'] else ""
+        teks_status = (
+            f"Keterangan bukti pembayaran Anda belum lengkap. Keterangan yang belum tercantum: {kurang}. "
+            f"Silakan kirim bukti pembayaran beserta keterangan tersebut ke admin "
+            f"lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
+        ) if kurang else (
+            f"Silakan kirim bukti pembayaran beserta keterangan tersebut ke admin "
+            f"lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
+        )
+        return {
+            'jawaban': teks_status,
+            'sumber': "",
+            'kelas_router': "bukti_bayar",
+            'keyakinan': conf_bert,
+            'peluang_eskalasi': p_esk_bert,
+            'keputusan_router': "teruskan",
+            'router_penjawab': "tidak_ada",
+            'telemetri_cascade': {
+                'indobertweet': {'status': 'eskalasi_bukti_bayar', 'alasan': 'Prediksi bukti_bayar diarahkan ke staf'},
+                'klasik': {'status': 'dilewati', 'alasan': 'Kanal bukti bayar dialihkan di router utama'},
+                'aturan': {'status': 'dilewati', 'alasan': 'Kanal bukti bayar dialihkan di router utama'},
+                'router_penjawab': 'tidak_ada'
+            },
+            'jarak_terbaik': None,
+            'tumpang_tindih_kata': None,
+            'skor_gabungan': None,
+            'susunan': susunan,
+            'kata_isi': [],
+            'keputusan': "teruskan_ke_staf",
+            'alasan': "Bukti bayar tidak dibaca otomatis oleh bot; diperiksa kelengkapan teks dan diarahkan ke admin.",
+            'dialihkan_oleh': "aturan",
+            'potongan_terpakai': [],
+            'waktu_ms': waktu_ms,
+        }
+
+    if kls_bert in KELAS_ESKALASI or p_esk_bert >= 0.100 or (kls_bert == "bukti_bayar" and is_tanya_histori):
+        alasan_esk_bert = f"P(eskalasi) {p_esk_bert:.4f} >= 0.100 (kelas '{kls_bert}', keyakinan {conf_bert:.2f})"
+        telemetri_cascade['indobertweet'] = {'status': 'eskalasi', 'alasan': alasan_esk_bert}
+    else:
+        sukses, res_cari = eksekusi_pencarian_dan_gerbang(pesan_normal, susunan=susunan, kls_router=kls_bert, conf_router=conf_bert, p_esk=p_esk_bert, mulai_waktu=mulai_waktu)
+        if sukses:
+            res_cari['router_penjawab'] = "indobertweet"
+            telemetri_cascade['indobertweet'] = {'status': 'jawab', 'alasan': f"Lolos router (P_esk={p_esk_bert:.4f}) dan gerbang leksikal (jarak={res_cari['jarak_terbaik']:.3f}, overlap={res_cari['tumpang_tindih_kata']:.2f})"}
+            telemetri_cascade['klasik'] = {'status': 'dilewati', 'alasan': 'Sudah terjawab oleh IndoBERTweet'}
+            telemetri_cascade['aturan'] = {'status': 'dilewati', 'alasan': 'Sudah terjawab oleh IndoBERTweet'}
+            telemetri_cascade['router_penjawab'] = "indobertweet"
+            res_cari['telemetri_cascade'] = telemetri_cascade
+            return res_cari
+        else:
+            alasan_esk_bert = f"Router lolos, namun {res_cari['alasan']}"
+            telemetri_cascade['indobertweet'] = {'status': 'eskalasi', 'alasan': alasan_esk_bert}
+
+    # --- LANGKAH 2: ROUTER TF-IDF KLASIK (PEMBANDING, LAZY LOADED) ---
+    info_klasik = inferensi_klasik_lazy(pesan_normal)
+    if info_klasik is not None:
+        kls_klasik = info_klasik['kelas']
+        conf_klasik = info_klasik['keyakinan']
+        p_esk_klasik = info_klasik['peluang_eskalasi']
+
+        if kls_klasik in KELAS_ESKALASI or p_esk_klasik >= 0.300 or (kls_klasik == "bukti_bayar" and is_tanya_histori):
+            alasan_esk_klasik = f"P(eskalasi) {p_esk_klasik:.4f} >= 0.300 (kelas '{kls_klasik}', keyakinan {conf_klasik:.2f})"
+            telemetri_cascade['klasik'] = {'status': 'eskalasi', 'alasan': alasan_esk_klasik}
+        else:
+            sukses_k, res_cari_k = eksekusi_pencarian_dan_gerbang(pesan_normal, susunan=susunan, kls_router=kls_klasik, conf_router=conf_klasik, p_esk=p_esk_klasik, mulai_waktu=mulai_waktu)
+            if sukses_k:
+                res_cari_k['router_penjawab'] = "klasik"
+                telemetri_cascade['klasik'] = {'status': 'jawab', 'alasan': f"Lolos router klasik (P_esk={p_esk_klasik:.4f}) dan gerbang leksikal (jarak={res_cari_k['jarak_terbaik']:.3f}, overlap={res_cari_k['tumpang_tindih_kata']:.2f})"}
+                telemetri_cascade['aturan'] = {'status': 'dilewati', 'alasan': 'Sudah terjawab oleh router klasik'}
+                telemetri_cascade['router_penjawab'] = "klasik"
+                res_cari_k['telemetri_cascade'] = telemetri_cascade
+                return res_cari_k
+            else:
+                alasan_esk_klasik = f"Router klasik lolos, namun {res_cari_k['alasan']}"
+                telemetri_cascade['klasik'] = {'status': 'eskalasi', 'alasan': alasan_esk_klasik}
+    else:
+        telemetri_cascade['klasik'] = {'status': 'eskalasi', 'alasan': 'Model klasik tidak tersedia'}
+
+    # --- LANGKAH 3: ROUTER ATURAN (RULE-BASED SEGMEN MATCHING) ---
+    rule_segmen = cocokkan_segmen_aturan(pesan_normal)
+    if rule_segmen is not None:
+        sukses_r, res_r = eksekusi_jawaban_segmen_aturan(pesan_normal, rule_segmen, susunan=susunan, mulai_waktu=mulai_waktu)
+        if sukses_r:
+            res_r['router_penjawab'] = "aturan"
+            telemetri_cascade['aturan'] = {'status': 'jawab', 'alasan': f"Cocok segmen {rule_segmen['id']} ({rule_segmen['target_judul']}) dan overlap leksikal ({res_r['tumpang_tindih_kata']:.2f}) >= 50%"}
+            telemetri_cascade['router_penjawab'] = "aturan"
+            res_r['telemetri_cascade'] = telemetri_cascade
+            return res_r
+        else:
+            telemetri_cascade['aturan'] = {'status': 'eskalasi', 'alasan': res_r['alasan']}
+    else:
+        telemetri_cascade['aturan'] = {'status': 'eskalasi', 'alasan': 'Tidak ada segmen aturan yang cocok secara spesifik / ambigu'}
+
+    # --- JIKA KETIGA ROUTER MENERUSKAN (FINAL FALLBACK) ---
+    waktu_ms = round((time.perf_counter() - mulai_waktu) * 1000, 2)
+    alasan_lengkap = (
+        f"Semua router meneruskan ke admin: "
+        f"[IndoBERTweet: {telemetri_cascade['indobertweet']['alasan']}] -> "
+        f"[Klasik: {telemetri_cascade['klasik']['alasan']}] -> "
+        f"[Aturan: {telemetri_cascade['aturan']['alasan']}]"
+    )
+    return {
+        'jawaban': (
+            f"Pertanyaan Anda berada di luar cakupan informasi otomatis bot "
+            f"atau memerlukan penanganan khusus. "
+            f"Silakan hubungi admin lewat WhatsApp resmi kampus pada jam layanan {JAM_LAYANAN_TEKS}."
+        ),
+        'sumber': "",
+        'kelas_router': kls_bert,
+        'keyakinan': conf_bert,
+        'peluang_eskalasi': p_esk_bert,
+        'keputusan_router': "teruskan",
+        'router_penjawab': "tidak_ada",
+        'telemetri_cascade': telemetri_cascade,
+        'jarak_terbaik': None,
+        'tumpang_tindih_kata': None,
+        'skor_gabungan': None,
+        'susunan': susunan,
+        'kata_isi': [],
+        'keputusan': "teruskan_ke_staf",
+        'alasan': alasan_lengkap,
+        'dialihkan_oleh': "router",
+        'potongan_terpakai': [],
         'waktu_ms': waktu_ms,
     }
 
@@ -1299,28 +1685,13 @@ def jawab(pesan: str, sistem: str = "B", router_mode: str = None, susunan: str =
     Parameter:
       - pesan: teks masukan pertanyaan
       - sistem: pilihan sistem ("B" | "A" | "BM25")
-      - router_mode: pilihan router ("aturan" | "klasik" | "indobertweet")
+      - router_mode: pilihan router ("cascade" | "indobertweet" | "klasik" | "aturan")
       - susunan: pilihan susunan sistem B ("V1" | "V2" | "V3")
     Mengembalikan dict hasil lengkap.
     """
     sistem_bersih = sistem.strip().upper()
     if sistem_bersih == "B" or "B " in sistem_bersih:
         return jawab_sistem_b(pesan, router_mode=router_mode, susunan=susunan)
-    elif sistem_bersih == "A":
-        return jawab_gemini(pesan)
-    elif sistem_bersih == "BM25":
-        return jawab_bm25(pesan)
-    """
-    Fungsi utama antarmuka bot.
-    Parameter:
-      - pesan: teks masukan pertanyaan
-      - sistem: pilihan sistem ("B" | "A" | "BM25")
-      - router_mode: pilihan router ("aturan" | "klasik" | "indobertweet")
-    Mengembalikan dict hasil lengkap.
-    """
-    sistem_bersih = sistem.strip().upper()
-    if sistem_bersih == "B" or "B " in sistem_bersih:
-        return jawab_sistem_b(pesan, router_mode=router_mode)
     elif sistem_bersih == "A":
         return jawab_gemini(pesan)
     elif sistem_bersih == "BM25":
@@ -1333,14 +1704,16 @@ if __name__ == "__main__":
     import sys, io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-    print("Menguji fungsi bot.jawab()...")
+    print("Menguji fungsi bot.jawab() dengan router cascade...")
     tes_pesan = "Halo min, bagaimana cara bayar ektm lewat atm bni?"
     hasil = jawab(tes_pesan)
-    print("\nPertanyaan:", tes_pesan)
-    print("Keputusan :", hasil['keputusan'])
-    print("Alasan    :", hasil['alasan'])
-    print("Kelas     :", hasil['kelas_router'])
-    print("Jarak     :", hasil['jarak_terbaik'])
-    print("Sumber    :", hasil['sumber'])
-    print("Jawaban   :\n", hasil['jawaban'][:200], "...")
-    print(f"Waktu     : {hasil['waktu_ms']} ms")
+    print("\nPertanyaan     :", tes_pesan)
+    print("Keputusan      :", hasil['keputusan'])
+    print("Router Penjawab:", hasil.get('router_penjawab'))
+    print("Alasan         :", hasil['alasan'])
+    print("Kelas          :", hasil['kelas_router'])
+    print("Jarak          :", hasil['jarak_terbaik'])
+    print("Sumber         :", hasil['sumber'])
+    print("Jawaban        :\n", hasil['jawaban'][:200], "...")
+    print(f"Waktu          : {hasil['waktu_ms']} ms")
+
